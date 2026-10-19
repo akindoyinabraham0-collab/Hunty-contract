@@ -6,10 +6,14 @@
 
 mod errors;
 mod migration;
+#[cfg(test)]
+mod monitoring_alerts_test;
 // Public so `tests/storage_keys.rs` can assert on persisted rate-limit keys.
 pub mod rate_limit;
 mod sanitization;
 mod storage;
+#[cfg(test)]
+mod test_progress_reads;
 pub mod types;
 
 use crate::errors::{HuntError, HuntErrorCode};
@@ -168,6 +172,9 @@ pub(crate) const MIN_CLUE_POINTS: u32 = 1;
 /// Maximum points a clue can be worth. A clue above this cap multiplies into
 /// a score that saturates u32 and flattens the leaderboard into a tie.
 pub(crate) const MAX_CLUE_POINTS: u32 = 10_000;
+
+/// Maximum allowed scoring weight for a clue.
+pub(crate) const MAX_CLUE_WEIGHT: u32 = 10;
 /// Lowest difficulty tier for a clue. 1 = easiest.
 pub(crate) const MIN_CLUE_DIFFICULTY: u32 = 1;
 /// Highest difficulty tier for a clue. These are the tiers the UI exposes:
@@ -827,7 +834,7 @@ impl HuntyCore {
     /// * `is_required` - Whether this clue must be solved to complete the hunt
     /// * `difficulty` - Optional difficulty tier (defaults to 1) used as a multiplier on
     ///   the clue's points. Valid scale is 1..=5, where 1 is easiest and 5 is hardest.
-    /// * `weight` - Optional weight multiplier (defaults to 1)
+    /// * `weight` - Optional weight multiplier from 1 to 10 (defaults to 1)
     ///
     /// # Returns
     /// The sequential clue ID assigned within the hunt
@@ -977,7 +984,7 @@ impl HuntyCore {
         .map_err(|_| HuntErrorCode::InvalidQuestion)?;
 
         let weight_val = weight.unwrap_or(1);
-        if weight_val == 0 {
+        if !(1..=MAX_CLUE_WEIGHT).contains(&weight_val) {
             return Err(HuntErrorCode::from(HuntError::InvalidWeight));
         }
 
@@ -4645,6 +4652,13 @@ impl HuntyCore {
         admin: Address,
     ) -> Result<migration::MigrationReport, hunty_migration::UpgradeAuthError> {
         migration::HuntyCoreMigration::rollback_migration(&env, &admin)
+    }
+
+    /// Acknowledge all current monitoring alerts. Only the contract admin may clear them.
+    pub fn clear_alerts(env: Env, admin: Address) -> Result<(), HuntErrorCode> {
+        Self::require_admin(&env, &admin)?;
+        hunty_common::monitoring::Monitoring::clear_alerts(&env);
+        Ok(())
     }
 
     pub fn get_active_alerts(env: Env) -> Vec<hunty_common::monitoring::HealthAlert> {

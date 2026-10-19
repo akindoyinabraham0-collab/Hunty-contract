@@ -5,7 +5,7 @@
 
 use crate::errors::HuntErrorCode;
 use crate::storage::Storage;
-use crate::types::{BatchClueInput, HuntStatus};
+use crate::types::{BatchClueInput, HuntStatus, PlayerProgress};
 use crate::HuntyCore;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{vec, Address, Env, String};
@@ -115,27 +115,127 @@ fn batch_and_single_clue_creation_produce_the_same_clue() {
 }
 
 #[test]
-fn zero_weight_is_rejected_for_batched_clues() {
+fn out_of_range_weights_are_rejected_for_single_and_batched_clues() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register(HuntyCore, ());
+    let admin = Address::generate(&env);
+    let contract_id = env.register(HuntyCore, (admin,));
     let creator = Address::generate(&env);
-    let hunt_id = create_hunt(&env, &contract_id, &creator, "Zero Weight");
+    let hunt_id = create_hunt(&env, &contract_id, &creator, "Invalid Weight");
 
-    env.as_contract(&contract_id, || {
-        assert_eq!(
+    for weight in [0, 11, u32::MAX] {
+        env.as_contract(&contract_id, || {
+            assert_eq!(
+                HuntyCore::add_clue(
+                    env.clone(),
+                    hunt_id,
+                    String::from_str(&env, "Q1"),
+                    String::from_str(&env, "answer"),
+                    10,
+                    true,
+                    Some(2),
+                    Some(weight),
+                ),
+                Err(HuntErrorCode::InvalidWeight)
+            );
+        });
+        env.as_contract(&contract_id, || {
+            assert_eq!(
+                HuntyCore::add_clues(
+                    env.clone(),
+                    hunt_id,
+                    vec![&env, batch_clue(&env, "Q1", 2, Some(weight))],
+                ),
+                Err(HuntErrorCode::InvalidWeight)
+            );
+        });
+        env.as_contract(&contract_id, || {
+            // Rejected inputs must not consume clue IDs or change hunt counts.
+            assert_eq!(Storage::get_clue_counter(&env, hunt_id), 0);
+            let hunt = Storage::get_hunt_or_error(&env, hunt_id).unwrap();
+            assert_eq!(hunt.total_clues, 0);
+            assert_eq!(hunt.status, HuntStatus::Draft);
+        });
+    }
+}
+
+#[test]
+fn single_and_batched_clues_accept_weight_boundaries_and_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(HuntyCore, (admin,));
+    let creator = Address::generate(&env);
+    let single_hunt = create_hunt(&env, &contract_id, &creator, "Single Boundaries");
+    let batch_hunt = create_hunt(&env, &contract_id, &creator, "Batch Boundaries");
+
+    for (index, weight) in [Some(1), None, Some(10)].into_iter().enumerate() {
+        env.as_contract(&contract_id, || {
+            HuntyCore::add_clue(
+                env.clone(),
+                single_hunt,
+                String::from_str(&env, "Question"),
+                String::from_str(&env, "answer"),
+                10,
+                true,
+                Some(2),
+                weight,
+            )
+            .unwrap();
+        });
+        env.as_contract(&contract_id, || {
             HuntyCore::add_clues(
                 env.clone(),
-                hunt_id,
-                vec![&env, batch_clue(&env, "Q1", 2, Some(0))],
-            ),
-            Err(HuntErrorCode::InvalidWeight)
-        );
-        // The rejected batch must not leave a partially added clue behind.
-        assert_eq!(Storage::get_clue_counter(&env, hunt_id), 0);
-        let hunt = Storage::get_hunt_or_error(&env, hunt_id).unwrap();
-        assert_eq!(hunt.total_clues, 0);
-        assert_eq!(hunt.status, HuntStatus::Draft);
+                batch_hunt,
+                vec![&env, batch_clue(&env, "Question", 2, weight)],
+            )
+            .unwrap();
+        });
+        env.as_contract(&contract_id, || {
+            let clue_id = index as u32 + 1;
+            let expected_weight = weight.unwrap_or(1);
+            assert_eq!(
+                Storage::get_clue_or_error(&env, single_hunt, clue_id)
+                    .unwrap()
+                    .weight,
+                expected_weight
+            );
+            assert_eq!(
+                Storage::get_clue_or_error(&env, batch_hunt, clue_id)
+                    .unwrap()
+                    .weight,
+                expected_weight
+            );
+        });
+    }
+}
+
+#[test]
+fn maximum_weight_clues_allow_consecutive_score_updates() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(HuntyCore, (admin,));
+    let creator = Address::generate(&env);
+    let hunt_id = create_hunt(&env, &contract_id, &creator, "Maximum Scores");
+    let player = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        let mut input = batch_clue(&env, "Maximum", 5, Some(10));
+        input.points = 10_000;
+        HuntyCore::add_clues(env.clone(), hunt_id, vec![&env, input.clone(), input]).unwrap();
+        let mut hunt = Storage::get_hunt_or_error(&env, hunt_id).unwrap();
+        hunt.start_multiplier_bps = 50_000;
+        let mut progress = PlayerProgress::new(&env, player.clone(), hunt_id, 0);
+
+        for clue_id in 1..=2 {
+            let clue = Storage::get_clue_or_error(&env, hunt_id, clue_id).unwrap();
+            let score = HuntyCore::calculate_score(&hunt, &clue, 0, 0);
+            assert_eq!(score, 2_500_000);
+            progress.complete_clue(&env, clue_id, score).unwrap();
+        }
+        assert_eq!(progress.total_score, 5_000_000);
+        assert_eq!(progress.completed_clues.len(), 2);
     });
 }
 

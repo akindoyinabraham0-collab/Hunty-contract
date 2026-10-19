@@ -24,6 +24,7 @@ pub struct ContractHealth {
     pub failed_invocations: u64,
     pub failure_rate_bps: u32,
     pub avg_gas_units: u64,
+    /// Alert occurrences since the last administrative clear.
     pub active_alerts: u32,
 }
 
@@ -38,6 +39,37 @@ pub struct HealthAlert {
 pub struct Monitoring;
 
 impl Monitoring {
+    /// Read legacy instance counters until the next mutation migrates them.
+    fn alert_map(env: &Env) -> Map<String, HealthAlert> {
+        env.storage()
+            .persistent()
+            .get(&ALERT_MAP_KEY)
+            .or_else(|| env.storage().instance().get(&ALERT_MAP_KEY))
+            .unwrap_or_else(|| Map::new(env))
+    }
+
+    fn save_alert_map(env: &Env, alerts: &Map<String, HealthAlert>) {
+        env.storage().persistent().set(&ALERT_MAP_KEY, alerts);
+        env.storage()
+            .persistent()
+            .extend_ttl(&ALERT_MAP_KEY, 172_800, 518_400);
+        env.storage().instance().remove(&ALERT_MAP_KEY);
+        env.storage().instance().remove(&ALERTS_KEY);
+    }
+
+    /// Acknowledge all current alerts. Callers must enforce their contract's
+    /// admin authorization before calling this shared helper.
+    pub fn clear_alerts(env: &Env) {
+        let count = Self::health_dashboard(env).active_alerts;
+        env.storage().persistent().remove(&ALERT_MAP_KEY);
+        env.storage().instance().remove(&ALERT_MAP_KEY);
+        env.storage().instance().remove(&ALERTS_KEY);
+        env.events().publish(
+            (symbol_short!("alert"), symbol_short!("cleared")),
+            (count, env.ledger().sequence()),
+        );
+    }
+
     /// Telemetry record. Emits an event for off-chain indexers AND updates the
     /// on-chain counters (`INVCT`/`FAILCT`/`GASUN`) that `health_dashboard`
     /// reads, so the dashboard reflects every recorded invocation.
@@ -120,11 +152,7 @@ impl Monitoring {
         let alert_type = String::from_str(env, kind);
         let ledger = env.ledger().sequence() as u64;
 
-        let mut alerts: Map<String, HealthAlert> = env
-            .storage()
-            .instance()
-            .get(&ALERT_MAP_KEY)
-            .unwrap_or_else(|| Map::new(env));
+        let mut alerts = Self::alert_map(env);
 
         let count = alerts
             .get(alert_type.clone())
@@ -140,13 +168,7 @@ impl Monitoring {
                 last_ledger: ledger,
             },
         );
-        env.storage().instance().set(&ALERT_MAP_KEY, &alerts);
-
-        // Aggregate counter kept for `ContractHealth::active_alerts`.
-        let total: u32 = env.storage().instance().get(&ALERTS_KEY).unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&ALERTS_KEY, &total.saturating_add(1));
+        Self::save_alert_map(env, &alerts);
 
         env.events().publish(
             (symbol_short!("alert"), symbol_short!("raised")),
@@ -154,13 +176,9 @@ impl Monitoring {
         );
     }
 
-    /// All alert kinds seen so far, with their individual counts.
+    /// Alert kinds raised since the last clear, with their occurrence counts.
     pub fn active_alerts(env: &Env) -> Vec<HealthAlert> {
-        let alerts: Map<String, HealthAlert> = env
-            .storage()
-            .instance()
-            .get(&ALERT_MAP_KEY)
-            .unwrap_or_else(|| Map::new(env));
+        let alerts = Self::alert_map(env);
 
         let mut out: Vec<HealthAlert> = Vec::new(env);
         for (_, alert) in alerts.iter() {
@@ -173,7 +191,10 @@ impl Monitoring {
         let total: u64 = env.storage().instance().get(&INVOCATIONS_KEY).unwrap_or(0);
         let failures: u64 = env.storage().instance().get(&FAILURES_KEY).unwrap_or(0);
         let gas_total: u64 = env.storage().instance().get(&GAS_UNITS_KEY).unwrap_or(0);
-        let alerts: u32 = env.storage().instance().get(&ALERTS_KEY).unwrap_or(0);
+        let mut alerts = 0u32;
+        for (_, alert) in Self::alert_map(env).iter() {
+            alerts = alerts.saturating_add(alert.count);
+        }
 
         let failure_rate_bps = if let Some(rate) = failures
             .checked_mul(10_000)

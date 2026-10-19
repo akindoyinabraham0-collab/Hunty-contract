@@ -4291,6 +4291,13 @@ impl RewardManager {
         migration::RewardManagerMigration::rollback_migration(&env, &admin)
     }
 
+    /// Acknowledge all current monitoring alerts. Only the contract admin may clear them.
+    pub fn clear_alerts(env: Env, admin: Address) -> Result<(), RewardErrorCode> {
+        Self::require_admin(&env, &admin)?;
+        hunty_common::monitoring::Monitoring::clear_alerts(&env);
+        Ok(())
+    }
+
     pub fn get_health_dashboard(env: Env) -> hunty_common::monitoring::ContractHealth {
         hunty_common::monitoring::Monitoring::health_dashboard(&env)
     }
@@ -4385,6 +4392,8 @@ fn sort_amounts(amounts: soroban_sdk::Vec<i128>, len: u32) -> soroban_sdk::Vec<i
 
 pub mod errors;
 mod migration;
+#[cfg(test)]
+mod monitoring_alerts_test;
 mod nft_handler;
 pub mod storage;
 mod token_handler;

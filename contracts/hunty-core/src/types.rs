@@ -163,8 +163,8 @@ pub struct BatchClueInput {
     /// Difficulty multiplies the clue's points: points earned = points * difficulty.
     pub difficulty: u32,
     /// Optional weight multiplier, matching the `weight` argument of
-    /// `add_clue`. `None` defaults to 1; `Some(0)` is rejected with
-    /// `InvalidWeight`.
+    /// `add_clue`. `None` defaults to 1; values outside 1..=10 are rejected
+    /// with `InvalidWeight`.
     pub weight: Option<u32>,
 }
 

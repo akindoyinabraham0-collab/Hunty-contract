@@ -6,4 +6,6 @@ pub mod monitoring;
 
 #[cfg(test)]
 mod test_audit;
+#[cfg(test)]
+mod test_monitoring;
 pub mod uri;

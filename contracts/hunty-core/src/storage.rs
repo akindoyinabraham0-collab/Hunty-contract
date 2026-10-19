@@ -984,7 +984,9 @@ impl Storage {
             .persistent()
             .set(&key, &progress.to_stored(activated_at));
 
-        let policy = if progress.is_completed || progress.reward_claimed {
+        // Completed players still need their progress to claim a reward.
+        // Only acknowledged claims may use the shorter retention policy.
+        let policy = if progress.reward_claimed {
             TtlPolicy::Short
         } else {
             TtlPolicy::Default
@@ -1030,16 +1032,25 @@ impl Storage {
     ) -> Result<Option<PlayerProgress>, HuntError> {
         let key = Self::progress_key(hunt_id, player);
 
-        let activated_at = Self::get_hunt(env, hunt_id)
-            .map(|h| h.activated_at)
-            .unwrap_or(0);
-
         let raw_val: Option<Val> = env.storage().persistent().get(&key);
 
         let val = match raw_val {
             Some(v) => v,
 
             None => return Ok(None),
+        };
+
+        // Compact timestamps only need the activation time. Keep warm reads
+        // independent of the full Hunt payload, but preserve lazy migration
+        // when an older instance hunt has not yet reached persistent storage.
+        let activated_at = match Self::get_hunt_cache(env, hunt_id) {
+            Some(cache) if Self::has_persistent_hunt(env, hunt_id) => cache.activated_at,
+            _ => Self::get_hunt(env, hunt_id)
+                .map(|hunt| {
+                    Self::save_hunt_cache(env, &hunt);
+                    hunt.activated_at
+                })
+                .unwrap_or(0),
         };
 
         if let Ok(stored) = StoredPlayerProgress::try_from_val(env, &val) {
@@ -3313,6 +3324,65 @@ impl Storage {
 
             teams_swept: team_count,
         }
+    }
+}
+
+#[cfg(test)]
+
+mod progress_ttl_tests {
+    use super::*;
+    use crate::HuntyCore;
+    use soroban_sdk::testutils::{storage::Persistent as _, Address as _, Ledger as _};
+
+    #[test]
+    fn completed_unclaimed_winner_keeps_default_ttl() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(HuntyCore, (admin,));
+        let player = Address::generate(&env);
+        let mut progress = PlayerProgress::new(&env, player.clone(), 1, 0);
+        progress.is_completed = true;
+        progress.completed_at = 60;
+        progress.completion_rank = 1;
+        let key = Storage::progress_key(1, &player);
+
+        env.as_contract(&contract_id, || {
+            Storage::save_player_progress(&env, &progress, 0);
+            assert_eq!(env.storage().persistent().get_ttl(&key), TTL_EXTEND_DEFAULT);
+        });
+
+        // Cross the entire short retention window; an unclaimed winner's
+        // record must still be live and eligible for the claim path to read.
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + TTL_EXTEND_SHORT + 1);
+        env.as_contract(&contract_id, || {
+            let stored: StoredPlayerProgress = env.storage().persistent().get(&key).unwrap();
+            let loaded = PlayerProgress::from_stored(&env, stored, player.clone(), 1, 0);
+            assert!(loaded.is_completed);
+            assert!(!loaded.reward_claimed);
+            assert_eq!(loaded.completion_rank, 1);
+            assert_eq!(loaded.completed_at, 60);
+        });
+    }
+
+    #[test]
+    fn claimed_progress_uses_short_ttl() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(HuntyCore, (admin,));
+        let player = Address::generate(&env);
+        let mut progress = PlayerProgress::new(&env, player.clone(), 1, 0);
+        progress.is_completed = true;
+        progress.reward_claimed = true;
+        env.as_contract(&contract_id, || {
+            Storage::save_player_progress(&env, &progress, 0);
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get_ttl(&Storage::progress_key(1, &player)),
+                TTL_EXTEND_SHORT
+            );
+        });
     }
 }
 
