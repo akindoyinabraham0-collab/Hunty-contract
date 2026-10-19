@@ -787,7 +787,9 @@ pub struct RewardManagerSetEvent {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimeBonusConfig {
+    /// Initial multiplier in basis points, between 10_000 (1x) and 50_000 (5x).
     pub start_multiplier_bps: u32,
+    /// Final multiplier, between 10_000 and the initial multiplier.
     pub min_multiplier_bps: u32,
     pub decay_duration_secs: u64,
 }
@@ -796,7 +798,8 @@ impl TimeBonusConfig {
     pub fn is_valid(&self) -> bool {
         self.decay_duration_secs > 0
             && self.start_multiplier_bps >= self.min_multiplier_bps
-            && self.min_multiplier_bps >= 10_000
+            && self.min_multiplier_bps >= crate::MIN_START_MULTIPLIER_BPS
+            && self.start_multiplier_bps <= crate::MAX_START_MULTIPLIER_BPS
     }
 
     pub fn multiplier_bps_at(&self, elapsed_secs: u64) -> u32 {

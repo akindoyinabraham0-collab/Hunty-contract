@@ -9,6 +9,8 @@ const ALERTS_KEY: soroban_sdk::Symbol = symbol_short!("ALERT");
 const LARGE_WD_THRESHOLD_MAP: soroban_sdk::Symbol = symbol_short!("LGWDMAP");
 /// Per-kind alert counters: `Map<alert_type, HealthAlert>`.
 const ALERT_MAP_KEY: soroban_sdk::Symbol = symbol_short!("ALERTMAP");
+const ALERT_TTL_THRESHOLD: u32 = 172_800;
+const ALERT_TTL_EXTEND_TO: u32 = 518_400;
 
 /// Default large-withdrawal alert threshold, calibrated for the native XLM
 /// token: 100 XLM (1_000_000_000 stroops; 1 XLM = 10_000_000 stroops).
@@ -41,18 +43,30 @@ pub struct Monitoring;
 impl Monitoring {
     /// Read legacy instance counters until the next mutation migrates them.
     fn alert_map(env: &Env) -> Map<String, HealthAlert> {
+        if let Some(alerts) = env.storage().persistent().get(&ALERT_MAP_KEY) {
+            // Regular monitoring must keep unacknowledged alerts live even
+            // when no new alerts are raised during the retention period.
+            Self::extend_alert_ttl(env);
+            alerts
+        } else {
+            env.storage()
+                .instance()
+                .get(&ALERT_MAP_KEY)
+                .unwrap_or_else(|| Map::new(env))
+        }
+    }
+
+    fn extend_alert_ttl(env: &Env) {
+        let extend_to = ALERT_TTL_EXTEND_TO.min(env.storage().max_ttl());
+        let threshold = ALERT_TTL_THRESHOLD.min(extend_to);
         env.storage()
             .persistent()
-            .get(&ALERT_MAP_KEY)
-            .or_else(|| env.storage().instance().get(&ALERT_MAP_KEY))
-            .unwrap_or_else(|| Map::new(env))
+            .extend_ttl(&ALERT_MAP_KEY, threshold, extend_to);
     }
 
     fn save_alert_map(env: &Env, alerts: &Map<String, HealthAlert>) {
         env.storage().persistent().set(&ALERT_MAP_KEY, alerts);
-        env.storage()
-            .persistent()
-            .extend_ttl(&ALERT_MAP_KEY, 172_800, 518_400);
+        Self::extend_alert_ttl(env);
         env.storage().instance().remove(&ALERT_MAP_KEY);
         env.storage().instance().remove(&ALERTS_KEY);
     }

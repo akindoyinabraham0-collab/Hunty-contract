@@ -1,7 +1,7 @@
 use crate::monitoring::{HealthAlert, Monitoring};
 use soroban_sdk::{
     contract, contractimpl, symbol_short,
-    testutils::{Events as _, Ledger as _},
+    testutils::{storage::Persistent as _, Events as _, Ledger as _},
     xdr, Env, Map, String, Symbol, TryFromVal, Val,
 };
 
@@ -14,8 +14,9 @@ impl MonitoredContract {
 }
 
 fn assert_last_clear_event(env: &Env, count: u32, ledger: u32) {
-    let events = env.events().all();
-    let event = events.events().last().unwrap();
+    let snapshot = env.events().all();
+    let events = snapshot.events();
+    let event = events.last().unwrap();
     let xdr::ContractEventBody::V0(body) = &event.body else {
         panic!("unexpected event body");
     };
@@ -127,5 +128,61 @@ fn clear_removes_legacy_alerts_without_requiring_another_raise() {
         assert!(!env.storage().persistent().has(&key));
         assert_eq!(Monitoring::health_dashboard(&env).active_alerts, 0);
         assert!(Monitoring::active_alerts(&env).is_empty());
+    });
+}
+
+#[test]
+fn monitoring_reads_refresh_unacknowledged_alert_ttl() {
+    let env = Env::default();
+    // Preserve contract/code entries while aging only the alert map below.
+    // Restore the normal minimum before the alert is first written.
+    let ledger = env.ledger().get();
+    env.ledger()
+        .set_min_persistent_entry_ttl(ledger.max_entry_ttl);
+    let cid = env.register(MonitoredContract, ());
+    env.ledger()
+        .set_min_persistent_entry_ttl(ledger.min_persistent_entry_ttl);
+    env.ledger().set_sequence_number(100);
+    let key = symbol_short!("ALERTMAP");
+    let initial_ttl = env.as_contract(&cid, || {
+        let max_ttl = env.storage().max_ttl();
+        env.storage().instance().extend_ttl(max_ttl, max_ttl);
+        Monitoring::raise_alert(&env, "large_withdrawal");
+        env.storage().persistent().get_ttl(&key)
+    });
+    assert!(initial_ttl > 172_800);
+
+    env.ledger().set_sequence_number(100 + initial_ttl - 100);
+    env.as_contract(&cid, || {
+        let max_ttl = env.storage().max_ttl();
+        env.storage().instance().extend_ttl(max_ttl, max_ttl);
+        assert_eq!(env.storage().persistent().get_ttl(&key), 100);
+        assert_eq!(Monitoring::active_alerts(&env).get(0).unwrap().count, 1);
+        assert_eq!(env.storage().persistent().get_ttl(&key), initial_ttl);
+    });
+
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + initial_ttl - 100);
+    env.as_contract(&cid, || {
+        assert_eq!(env.storage().persistent().get_ttl(&key), 100);
+        assert_eq!(Monitoring::health_dashboard(&env).active_alerts, 1);
+        assert_eq!(env.storage().persistent().get_ttl(&key), initial_ttl);
+    });
+}
+
+#[test]
+fn alert_ttl_respects_the_network_maximum() {
+    let env = Env::default();
+    env.ledger().set_max_entry_ttl(100_000);
+    let cid = env.register(MonitoredContract, ());
+    env.as_contract(&cid, || {
+        Monitoring::raise_alert(&env, "large_withdrawal");
+        assert_eq!(
+            env.storage()
+                .persistent()
+                .get_ttl(&symbol_short!("ALERTMAP")),
+            env.storage().max_ttl()
+        );
+        assert_eq!(Monitoring::health_dashboard(&env).active_alerts, 1);
     });
 }

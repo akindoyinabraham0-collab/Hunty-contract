@@ -484,6 +484,15 @@ impl HuntyCore {
         if has_supply && answers.len() != template_clues.len() {
             return Err(HuntErrorCode::InvalidAnswer);
         }
+        // Templates created before the weight cap must not bypass insertion validation.
+        for clue in template_clues.iter() {
+            if !(1..=MAX_CLUE_WEIGHT).contains(&clue.weight) {
+                return Err(HuntErrorCode::InvalidWeight);
+            }
+        }
+        if !Self::hunt_time_bonus_config(&template_hunt).is_valid() {
+            return Err(HuntErrorCode::InvalidTimeBonusConfig);
+        }
 
         let hunt_id = Self::create_hunt(
             env.clone(),
@@ -1369,8 +1378,13 @@ impl HuntyCore {
         let clue =
             Storage::get_clue_or_error(&env, hunt_id, clue_id).map_err(HuntErrorCode::from)?;
         let hint = clue.hint.clone().ok_or(HuntErrorCode::HintNotAvailable)?;
-        let mut progress = Storage::get_player_progress_or_error(&env, hunt_id, &player)
-            .map_err(HuntErrorCode::from)?;
+        let mut progress = Storage::get_player_progress_or_error_with_activated_at(
+            &env,
+            hunt_id,
+            &player,
+            hunt.activated_at,
+        )
+        .map_err(HuntErrorCode::from)?;
         if progress.has_completed_clue(clue_id) {
             return Err(HuntErrorCode::ClueAlreadyCompleted);
         }
@@ -2150,7 +2164,12 @@ impl HuntyCore {
             if !entry.is_completed {
                 continue;
             }
-            let mut progress = match Storage::get_player_progress(&env, hunt_id, &entry.player) {
+            let mut progress = match Storage::get_player_progress_with_activated_at(
+                &env,
+                hunt_id,
+                &entry.player,
+                hunt.activated_at,
+            ) {
                 Some(progress) => progress,
                 None => continue,
             };
@@ -2467,8 +2486,13 @@ impl HuntyCore {
             return Err(HuntErrorCode::InvalidHuntStatus);
         }
 
-        let mut progress = Storage::get_player_progress_or_error(&env, hunt_id, &player)
-            .map_err(HuntErrorCode::from)?;
+        let mut progress = Storage::get_player_progress_or_error_with_activated_at(
+            &env,
+            hunt_id,
+            &player,
+            hunt.activated_at,
+        )
+        .map_err(HuntErrorCode::from)?;
 
         // Verify the player has completed all required clues
         if !progress.is_completed {
@@ -2876,7 +2900,12 @@ impl HuntyCore {
         // registered for this hunt in the current activation cycle. Progress
         // from a previous cycle (the hunt was deactivated and reactivated) is
         // treated as stale and allowed to be overwritten by a fresh registration.
-        if let Some(existing) = Storage::get_player_progress(&env, hunt_id, &player) {
+        if let Some(existing) = Storage::get_player_progress_with_activated_at(
+            &env,
+            hunt_id,
+            &player,
+            hunt.activated_at,
+        ) {
             if existing.started_at >= hunt.activated_at {
                 return Err(HuntErrorCode::DuplicateRegistration);
             }
@@ -3212,7 +3241,14 @@ impl HuntyCore {
         // Cache read: cheaper than loading full Hunt from persistent storage
         let _cache = Self::validate_hunt_active_cached(&env, hunt_id)?;
 
-        if Storage::get_player_progress(&env, hunt_id, &player).is_some() {
+        if Storage::get_player_progress_with_activated_at(
+            &env,
+            hunt_id,
+            &player,
+            hunt.activated_at,
+        )
+        .is_some()
+        {
             return Err(HuntErrorCode::DuplicateRegistration);
         }
 
@@ -3260,8 +3296,13 @@ impl HuntyCore {
             return Err(HuntErrorCode::BannedPlayer);
         }
 
-        let mut progress = Storage::get_player_progress(&env, hunt_id, &player)
-            .ok_or(HuntErrorCode::PlayerNotRegistered)?;
+        let mut progress = Storage::get_player_progress_with_activated_at(
+            &env,
+            hunt_id,
+            &player,
+            hunt.activated_at,
+        )
+        .ok_or(HuntErrorCode::PlayerNotRegistered)?;
 
         let clue = Storage::get_clue(&env, hunt_id, clue_id).ok_or(HuntErrorCode::ClueNotFound)?;
 
@@ -3350,38 +3391,34 @@ impl HuntyCore {
     ) -> u32 {
         let elapsed = completed_at.saturating_sub(started_at);
 
-        let config = if hunt.time_bonus_start_bps.is_some()
-            || hunt.time_bonus_min_bps.is_some()
-            || hunt.time_bonus_decay_secs.is_some()
-        {
-            TimeBonusConfig {
-                start_multiplier_bps: hunt.time_bonus_start_bps.unwrap_or(
-                    hunt.start_multiplier_bps
-                        .clamp(MIN_START_MULTIPLIER_BPS, MAX_START_MULTIPLIER_BPS),
-                ),
-                min_multiplier_bps: hunt.time_bonus_min_bps.unwrap_or(MIN_START_MULTIPLIER_BPS),
-                decay_duration_secs: hunt
-                    .time_bonus_decay_secs
-                    .unwrap_or(DEFAULT_TIME_BONUS_DECAY_SECS),
-            }
-        } else {
-            TimeBonusConfig {
-                start_multiplier_bps: hunt
-                    .start_multiplier_bps
-                    .clamp(MIN_START_MULTIPLIER_BPS, MAX_START_MULTIPLIER_BPS),
-                min_multiplier_bps: MIN_START_MULTIPLIER_BPS,
-                decay_duration_secs: DEFAULT_TIME_BONUS_DECAY_SECS,
-            }
-        };
+        let config = Self::hunt_time_bonus_config(hunt);
 
-        let multiplier_bps = config.multiplier_bps_at(elapsed);
+        // Legacy hunts may contain weights or explicit bonuses saved before the caps.
+        // Bound them when scoring too, so later correct answers can still be recorded.
+        let multiplier_bps = config
+            .multiplier_bps_at(elapsed)
+            .clamp(MIN_START_MULTIPLIER_BPS, MAX_START_MULTIPLIER_BPS);
         let base_points = clue
             .points
             .saturating_mul(clue.difficulty)
-            .saturating_mul(clue.weight);
+            .saturating_mul(clue.weight.clamp(1, MAX_CLUE_WEIGHT));
         let score = u64::from(base_points) * u64::from(multiplier_bps)
             / u64::from(MIN_START_MULTIPLIER_BPS);
         score.min(u64::from(u32::MAX)) as u32
+    }
+
+    /// Resolve optional legacy bonus fields consistently for scoring and cloning.
+    fn hunt_time_bonus_config(hunt: &Hunt) -> TimeBonusConfig {
+        TimeBonusConfig {
+            start_multiplier_bps: hunt.time_bonus_start_bps.unwrap_or(
+                hunt.start_multiplier_bps
+                    .clamp(MIN_START_MULTIPLIER_BPS, MAX_START_MULTIPLIER_BPS),
+            ),
+            min_multiplier_bps: hunt.time_bonus_min_bps.unwrap_or(MIN_START_MULTIPLIER_BPS),
+            decay_duration_secs: hunt
+                .time_bonus_decay_secs
+                .unwrap_or(DEFAULT_TIME_BONUS_DECAY_SECS),
+        }
     }
 
     /// In team mode, returns true if any teammate has already completed this clue.
@@ -3647,8 +3684,13 @@ impl HuntyCore {
         // limits) runs BEFORE we write the processed-submission entry.  This prevents nonce
         // exhaustion on validation failures and stops unregistered addresses from bloating
         // ledger storage.  The replay guard above is a read-only check and stays in place.
-        let mut progress = Storage::get_player_progress(&env, hunt_id, &player)
-            .ok_or(HuntErrorCode::PlayerNotRegistered)?;
+        let mut progress = Storage::get_player_progress_with_activated_at(
+            &env,
+            hunt_id,
+            &player,
+            hunt.activated_at,
+        )
+        .ok_or(HuntErrorCode::PlayerNotRegistered)?;
 
         let clue = Storage::get_clue(&env, hunt_id, clue_id).ok_or(HuntErrorCode::ClueNotFound)?;
 
@@ -3748,8 +3790,13 @@ impl HuntyCore {
         )
         .map_err(HuntErrorCode::from)?;
 
-        let mut progress = Storage::get_player_progress(&env, hunt_id, &player)
-            .ok_or(HuntErrorCode::PlayerNotRegistered)?;
+        let mut progress = Storage::get_player_progress_with_activated_at(
+            &env,
+            hunt_id,
+            &player,
+            hunt.activated_at,
+        )
+        .ok_or(HuntErrorCode::PlayerNotRegistered)?;
         let clue = Storage::get_clue(&env, hunt_id, clue_id).ok_or(HuntErrorCode::ClueNotFound)?;
 
         if progress.has_completed_clue(clue_id) {
@@ -4073,7 +4120,7 @@ impl HuntyCore {
         window_size: u32,
         _caller: Option<Address>,
     ) -> Result<crate::types::LeaderboardWindow, HuntErrorCode> {
-        Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
+        let hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
 
         let queried_at = env.ledger().timestamp();
         // One counter read replaces loading the full player list just to learn
@@ -4092,7 +4139,12 @@ impl HuntyCore {
         for offset in 0..players.len() {
             // SAFETY: offset is in [0, players.len())
             let player = players.get(offset).unwrap();
-            let progress = match Storage::get_player_progress(&env, hunt_id, &player) {
+            let progress = match Storage::get_player_progress_with_activated_at(
+                &env,
+                hunt_id,
+                &player,
+                hunt.activated_at,
+            ) {
                 Some(progress) => progress,
                 // A dangling index entry must not abort the whole page.
                 None => continue,

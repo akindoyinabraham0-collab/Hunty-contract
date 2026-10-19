@@ -30,8 +30,11 @@ mod tests {
                     return None;
                 };
                 let contract = event.contract_id.as_ref()?;
-                let contract_val =
-                    Val::try_from_val(env, &xdr::ScVal::Address(contract.clone())).ok()?;
+                let contract_val = Val::try_from_val(
+                    env,
+                    &xdr::ScVal::Address(xdr::ScAddress::Contract(contract.clone())),
+                )
+                .ok()?;
                 let contract = Address::try_from_val(env, &contract_val).ok()?;
                 let topics = body
                     .topics

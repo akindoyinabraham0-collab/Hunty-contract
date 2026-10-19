@@ -1030,6 +1030,26 @@ impl Storage {
 
         player: &Address,
     ) -> Result<Option<PlayerProgress>, HuntError> {
+        Self::read_player_progress(env, hunt_id, player, None)
+    }
+
+    /// Read compact progress using an activation time from an already loaded
+    /// Hunt or validated HuntCache, without touching the Hunt ledger entry.
+    pub fn try_get_player_progress_with_activated_at(
+        env: &Env,
+        hunt_id: u64,
+        player: &Address,
+        activated_at: u64,
+    ) -> Result<Option<PlayerProgress>, HuntError> {
+        Self::read_player_progress(env, hunt_id, player, Some(activated_at))
+    }
+
+    fn read_player_progress(
+        env: &Env,
+        hunt_id: u64,
+        player: &Address,
+        activated_at: Option<u64>,
+    ) -> Result<Option<PlayerProgress>, HuntError> {
         let key = Self::progress_key(hunt_id, player);
 
         let raw_val: Option<Val> = env.storage().persistent().get(&key);
@@ -1040,18 +1060,12 @@ impl Storage {
             None => return Ok(None),
         };
 
-        // Compact timestamps only need the activation time. Keep warm reads
-        // independent of the full Hunt payload, but preserve lazy migration
-        // when an older instance hunt has not yet reached persistent storage.
-        let activated_at = match Self::get_hunt_cache(env, hunt_id) {
-            Some(cache) if Self::has_persistent_hunt(env, hunt_id) => cache.activated_at,
-            _ => Self::get_hunt(env, hunt_id)
-                .map(|hunt| {
-                    Self::save_hunt_cache(env, &hunt);
-                    hunt.activated_at
-                })
-                .unwrap_or(0),
-        };
+        // Callers with the Hunt already loaded skip both cache lookup and the
+        // persistent existence check (which still adds the full Hunt to the
+        // ledger footprint). Standalone reads preserve legacy migration and
+        // missing-Hunt behavior through the compatibility fallback.
+        let activated_at = activated_at
+            .unwrap_or_else(|| Self::player_progress_activated_at(env, hunt_id));
 
         if let Ok(stored) = StoredPlayerProgress::try_from_val(env, &val) {
             return Ok(Some(PlayerProgress::from_stored(
@@ -1078,6 +1092,20 @@ impl Storage {
         Err(HuntError::CorruptPlayerProgress)
     }
 
+    // Shared compatibility resolution for standalone and bulk progress reads.
+    // Bulk callers resolve once so the Hunt is never revisited per player.
+    fn player_progress_activated_at(env: &Env, hunt_id: u64) -> u64 {
+        match Self::get_hunt_cache(env, hunt_id) {
+            Some(cache) if Self::has_persistent_hunt(env, hunt_id) => cache.activated_at,
+            _ => Self::get_hunt(env, hunt_id)
+                .map(|hunt| {
+                    Self::save_hunt_cache(env, &hunt);
+                    hunt.activated_at
+                })
+                .unwrap_or(0),
+        }
+    }
+
     /// Retrieves player progress as an Option.
 
     /// Returns `None` if not registered or if progress entry is corrupt.
@@ -1090,6 +1118,17 @@ impl Storage {
         player: &Address,
     ) -> Option<PlayerProgress> {
         Self::try_get_player_progress(env, hunt_id, player)
+            .ok()
+            .flatten()
+    }
+
+    pub fn get_player_progress_with_activated_at(
+        env: &Env,
+        hunt_id: u64,
+        player: &Address,
+        activated_at: u64,
+    ) -> Option<PlayerProgress> {
+        Self::try_get_player_progress_with_activated_at(env, hunt_id, player, activated_at)
             .ok()
             .flatten()
     }
@@ -1130,6 +1169,16 @@ impl Storage {
         }
     }
 
+    pub fn get_player_progress_or_error_with_activated_at(
+        env: &Env,
+        hunt_id: u64,
+        player: &Address,
+        activated_at: u64,
+    ) -> Result<PlayerProgress, HuntError> {
+        Self::try_get_player_progress_with_activated_at(env, hunt_id, player, activated_at)?
+            .ok_or(HuntError::PlayerNotRegistered)
+    }
+
     /// Returns all registered players for a hunt.
 
     ///
@@ -1150,10 +1199,19 @@ impl Storage {
         let player_addresses = Self::get_player_addresses_for_hunt(env, hunt_id);
 
         let mut progress_list = Vec::new(env);
+        if player_addresses.is_empty() {
+            return progress_list;
+        }
+        let activated_at = Self::player_progress_activated_at(env, hunt_id);
 
         for i in 0..player_addresses.len() {
             if let Some(player) = player_addresses.get(i) {
-                if let Some(progress) = Self::get_player_progress(env, hunt_id, &player) {
+                if let Some(progress) = Self::get_player_progress_with_activated_at(
+                    env,
+                    hunt_id,
+                    &player,
+                    activated_at,
+                ) {
                     progress_list.push_back(progress);
                 }
             }
@@ -1188,10 +1246,19 @@ impl Storage {
         } else {
             core::cmp::min(limit, entries.len())
         };
+        if cap == 0 {
+            return progress_list;
+        }
+        let activated_at = Self::player_progress_activated_at(env, hunt_id);
 
         for i in 0..cap {
             if let Some(entry) = entries.get(i) {
-                if let Some(progress) = Self::get_player_progress(env, hunt_id, &entry.player) {
+                if let Some(progress) = Self::get_player_progress_with_activated_at(
+                    env,
+                    hunt_id,
+                    &entry.player,
+                    activated_at,
+                ) {
                     if progress.is_completed && !progress.reward_claimed {
                         progress_list.push_back(progress);
                     }
@@ -3331,23 +3398,64 @@ impl Storage {
 
 mod progress_ttl_tests {
     use super::*;
-    use crate::HuntyCore;
+    use crate::{HuntyCore, HuntyCoreClient};
     use soroban_sdk::testutils::{storage::Persistent as _, Address as _, Ledger as _};
+    use soroban_sdk::String;
 
     #[test]
     fn completed_unclaimed_winner_keeps_default_ttl() {
         let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_700_000_000);
         let admin = Address::generate(&env);
-        let contract_id = env.register(HuntyCore, (admin,));
+        // Keep contract/code entries live across the ledger jump, then restore
+        // the normal minimum before creating progress so its policy is tested.
+        let min_ttl = env.ledger().get().min_persistent_entry_ttl;
+        env.ledger().set_min_persistent_entry_ttl(TTL_EXTEND_ACTIVE);
+        let contract_id = env.register(HuntyCore, (admin.clone(),));
+        env.ledger().set_min_persistent_entry_ttl(min_ttl);
+        let client = HuntyCoreClient::new(&env, &contract_id);
         let player = Address::generate(&env);
-        let mut progress = PlayerProgress::new(&env, player.clone(), 1, 0);
-        progress.is_completed = true;
-        progress.completed_at = 60;
-        progress.completion_rank = 1;
-        let key = Storage::progress_key(1, &player);
+        let hunt_id = client.create_hunt(
+            &admin,
+            &String::from_str(&env, "Unclaimed winner TTL"),
+            &String::from_str(&env, "Claim after the short retention window"),
+            &None,
+            &None,
+            &0,
+            &None,
+            &None,
+        );
+        let clue_id = client.add_clue(
+            &hunt_id,
+            &String::from_str(&env, "Question"),
+            &String::from_str(&env, "answer"),
+            &10,
+            &true,
+            &None,
+            &None,
+        );
+        // A zero-value reward slot exercises claiming without an external
+        // reward-manager dependency.
+        client.set_reward_config(&hunt_id, &1, &0, &false, &None, &admin);
+        client.activate_hunt(&hunt_id, &admin);
+        client.register_player(&hunt_id, &player);
+        env.ledger().set_timestamp(1_700_000_060);
+        assert!(client.submit_answer(
+            &hunt_id,
+            &clue_id,
+            &player,
+            &String::from_str(&env, "answer"),
+            &1,
+            &env.ledger().timestamp(),
+        ));
+        let key = Storage::progress_key(hunt_id, &player);
 
         env.as_contract(&contract_id, || {
-            Storage::save_player_progress(&env, &progress, 0);
+            let progress = Storage::get_player_progress(&env, hunt_id, &player).unwrap();
+            assert!(progress.is_completed);
+            assert!(!progress.reward_claimed);
+            assert_eq!(progress.completion_rank, 1);
             assert_eq!(env.storage().persistent().get_ttl(&key), TTL_EXTEND_DEFAULT);
         });
 
@@ -3355,13 +3463,15 @@ mod progress_ttl_tests {
         // record must still be live and eligible for the claim path to read.
         env.ledger()
             .set_sequence_number(env.ledger().sequence() + TTL_EXTEND_SHORT + 1);
+        // The public claim path must find the winner after the original
+        // short TTL would have archived their progress.
+        client.complete_hunt(&hunt_id, &player);
         env.as_contract(&contract_id, || {
-            let stored: StoredPlayerProgress = env.storage().persistent().get(&key).unwrap();
-            let loaded = PlayerProgress::from_stored(&env, stored, player.clone(), 1, 0);
+            let loaded = Storage::get_player_progress(&env, hunt_id, &player).unwrap();
             assert!(loaded.is_completed);
-            assert!(!loaded.reward_claimed);
+            assert!(loaded.reward_claimed);
             assert_eq!(loaded.completion_rank, 1);
-            assert_eq!(loaded.completed_at, 60);
+            assert_eq!(loaded.completed_at, 1_700_000_060);
         });
     }
 
